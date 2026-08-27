@@ -1,0 +1,36 @@
+#!/bin/bash
+# S2I assemble script for DESDEO API (FastAPI / gunicorn + uvicorn).
+#
+# Key differences from the original script:
+#   - Uses uv instead of pip for dependency installation.
+#   - UV_PROJECT_ENVIRONMENT points uv at the S2I-managed virtualenv
+#     (/opt/app-root) so it does NOT create a separate .venv directory.
+#   - --frozen  → reproduces exactly what is pinned in uv.lock.
+#   - --no-dev  → skips dev-only deps (pytest, ruff, etc.).
+#   - --group web --group server → pulls in FastAPI, gunicorn, uvicorn, etc.
+#   - Django collectstatic block removed (not applicable here).
+#
+set -e
+shopt -s dotglob
+
+echo "---> Installing application source ..."
+mv /tmp/src/* "$HOME"
+
+# Restore permissions after source injection.
+fix-permissions /opt/app-root -P
+
+echo "---> Installing uv ..."
+pip install -q --upgrade pip
+pip install -q uv
+
+echo "---> Syncing Python dependencies via uv ..."
+# UV_PROJECT_ENVIRONMENT: use the existing S2I venv instead of creating .venv.
+# UV_PYTHON_PREFERENCE:   do not let uv download its own Python interpreter.
+UV_PROJECT_ENVIRONMENT="${VIRTUAL_ENV:-/opt/app-root}" \
+UV_PYTHON_PREFERENCE=only-system \
+  uv sync --frozen --no-dev --group web --group server
+
+echo "---> Dependencies installed."
+
+# Restore permissions for any artifacts written during install.
+fix-permissions /opt/app-root -P

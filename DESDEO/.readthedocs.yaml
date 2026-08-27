@@ -1,0 +1,45 @@
+# Read the Docs configuration file for MkDocs projects
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+
+# Required
+version: 2
+
+mkdocs:
+  configuration: mkdocs.rtd.yml
+
+# Set the version of Python and other tools you might need
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.12"
+  jobs:
+    pre_create_environment:
+      - asdf plugin add uv
+      - asdf install uv latest
+      - asdf global uv latest
+    create_environment:
+      - uv venv "${READTHEDOCS_VIRTUALENV_PATH}"
+    install:
+      - UV_PROJECT_ENVIRONMENT="${READTHEDOCS_VIRTUALENV_PATH}" uv sync --frozen --all-extras
+
+      # Ensure optimization solver binaries are available while building docs.
+      - mkdir -p "$HOME/tmp/custom_binaries"
+      - wget https://github.com/industrial-optimization-group/DESDEO/releases/download/supplementary/solver_binaries.tgz -O "$HOME/tmp/binaries.tgz"
+      - tar --strip-components=1 -xzf "$HOME/tmp/binaries.tgz" -C "$HOME/tmp/custom_binaries"
+      - chmod +x "$HOME/tmp/custom_binaries"/*
+
+      - cp -a "$HOME/tmp/custom_binaries"/. "${READTHEDOCS_VIRTUALENV_PATH}/bin/"
+
+      - bash -lc 'command -v ipopt && command -v bonmin'
+
+    # Seed the mkdocs-jupyter render cache from the published asset.
+    # If the asset is missing (first run), continue and let notebooks execute.
+    pre_build:
+      - 'echo "pre_build cwd: $(pwd)"'
+      - mkdir -p .cache
+      - >
+        wget https://github.com/industrial-optimization-group/DESDEO/releases/download/supplementary/notebook_cache.tgz
+        -O "$HOME/tmp/notebook_cache.tgz"
+        && tar -xzf "$HOME/tmp/notebook_cache.tgz" -C .cache
+        && echo "Seeded mkdocs-jupyter cache at $(pwd)/.cache/mkdocs-jupyter: $(ls -1 .cache/mkdocs-jupyter | wc -l) entries"
+        || echo "No notebook_cache.tgz asset found yet — notebooks will execute this build."

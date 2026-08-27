@@ -1,0 +1,479 @@
+"""Defines models for representing the state of various interactive methods."""
+
+from datetime import datetime
+from enum import Enum
+from typing import TYPE_CHECKING
+
+from pydantic import ConfigDict, computed_field
+from sqlalchemy.orm import object_session
+from sqlmodel import (
+    JSON,
+    Column,
+    Field,
+    Relationship,
+    Session,
+    SQLModel,
+    select,
+)
+
+from desdeo.problem import Tensor, VariableType
+
+from .nautilus_navigator import NautilusNavigatorInitializationState, NautilusNavigatorNavigationState
+from .state import (
+    CumulusClassificationState,
+    CumulusFinalState,
+    CumulusInitializationState,
+    CumulusModificationState,
+    CumulusObjectiveConstraintState,
+    CumulusSaveState,
+    EMOFetchState,
+    EMOIterateState,
+    EMOSaveState,
+    EMOSCOREState,
+    ENautilusFinalState,
+    ENautilusState,
+    GNIMBUSEndState,
+    GNIMBUSOptimizationState,
+    GNIMBUSVotingState,
+    IntermediateSolutionState,
+    NIMBUSClassificationState,
+    NIMBUSFinalState,
+    NIMBUSInitializationState,
+    NIMBUSSaveState,
+    RPMState,
+)
+from .user import User
+
+if TYPE_CHECKING:
+    from .problem import ProblemDB
+    from .session import InteractiveSessionDB
+
+
+class StateKind(str, Enum):
+    """Stores the normalized kinds `{method}.{phase}` of supported states.
+
+    Note:
+        Update this when adding new states. Be sure to update `KIND_TO_STATE`
+        in this file as well.
+    """
+
+    RPM_SOLVE = "reference_point_method.solve_candidates"
+    NIMBUS_SOLVE = "nimbus.solve_candidates"
+    NIMBUS_SAVE = "nimbus.save_solutions"
+    NIMBUS_INIT = "nimbus.initialize"
+    NIMBUS_FINAL = "nimbus.final"
+    GNIMBUS_OPTIMIZE = "gnimbus.optimize"
+    GNIMBUS_VOTE = "gnimbus.vote"
+    GNIMBUS_END = "gnimbus.end"
+    EMO_RUN = "emo.run"
+    EMO_SAVE = "emo.save_solutions"
+    EMO_FETCH = "emo.fetch_solutions"
+    EMO_SCORE = "emo.score_bands"
+    GENERIC_INTERMEDIATE = "generic.solve_intermediate"
+    ENAUTILUS_STEP = "e-nautilus.stepping"
+    ENAUTILUS_FINAL = "e-nautilus.final"
+    NAUTILUS_NAVIGATE = "nautilus.navigate"
+    NAUTILUS_INITIALIZE = "nautilus.initialize"
+    XNIMBUS_SOLVE = "xnimbus.solve_candidates"
+    XNIMBUS_SAVE = "xnimbus.save_solutions"
+    XNIMBUS_INIT = "xnimbus.initialize"
+    XNIMBUS_FINAL = "xnimbus.final"
+    CUMULUS_SOLVE = "cumulus.solve_candidates"
+    CUMULUS_SAVE = "cumulus.save_solutions"
+    CUMULUS_INIT = "cumulus.initialize"
+    CUMULUS_FINAL = "cumulus.final"
+    CUMULUS_MODIFY = "cumulus.modify"
+    CUMULUS_OBJ_CONSTRAINT = "cumulus.objective_constraint"
+
+
+class State(SQLModel, table=True):
+    """The 'polymorphic' state to store method information."""
+
+    __tablename__ = "states"
+
+    id: int | None = Field(default=None, primary_key=True)
+
+    # The state is polymorphic on these.
+    # TODO (@gialmisi): once SQLModel supports polymorphic table types, refactor this.
+    method: str = Field(index=True)  # the method name
+    phase: str = Field(index=True)  # the phase of the method
+    kind: StateKind = Field(index=True)  # normalized "{method}.{phase}", lowercase
+    date_time: str | None = Field(default=None)
+
+
+class StateDB(SQLModel, table=True):
+    """State holder with a single relationship to the base State."""
+
+    __tablename__ = "statedb"
+
+    id: int | None = Field(primary_key=True, default=None)
+
+    # Optional cross-links (keep as strings in other modules to avoid circulars)
+    problem_id: int | None = Field(foreign_key="problemdb.id", default=None)
+    session_id: int | None = Field(foreign_key="interactivesessiondb.id", default=None)
+
+    # lineage
+    parent_id: int | None = Field(foreign_key="statedb.id", default=None)
+
+    # one-to-one to base state
+    state_id: int | None = Field(foreign_key="states.id", default=None, index=True)
+    base_state: State | None = Relationship(
+        sa_relationship_kwargs={
+            "uselist": False,
+            "single_parent": True,
+            "cascade": "all, delete-orphan",
+            "foreign_keys": lambda: [StateDB.state_id],
+        }
+    )
+
+    parent: "StateDB" = Relationship(
+        back_populates="children",
+        sa_relationship_kwargs={"remote_side": lambda: StateDB.id},
+    )
+    children: list["StateDB"] = Relationship(
+        back_populates="parent",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+
+    session: "InteractiveSessionDB" = Relationship(back_populates="states")
+    problem: "ProblemDB" = Relationship(back_populates="states")
+
+    @classmethod
+    def create(
+        cls,
+        database_session: Session,
+        *,
+        problem_id: int | None = None,
+        session_id: int | None = None,
+        parent_id: int | None = None,
+        state: SQLModel | None = None,
+        kind: StateKind | None = None,
+    ) -> "StateDB":
+        """Build a StateDB + base State with a concrete substate."""
+        if kind is None:
+            sub_cls = type(state)
+            for cls_in_mro in sub_cls.mro():
+                if cls_in_mro in SUBSTATE_TO_KIND:
+                    kind = SUBSTATE_TO_KIND[cls_in_mro]
+                    break
+            if kind is None:
+                raise ValueError(f"No StateKind mapping for substate type {sub_cls!r}")
+
+        method, phase = _method_phase_from_kind(kind)
+        base = State(method=method, phase=phase, kind=kind, date_time=datetime.now().isoformat())
+
+        row = cls(
+            problem_id=problem_id,
+            session_id=session_id,
+            parent_id=parent_id,
+            base_state=base,
+        )
+        database_session.add(row)
+
+        # Persist base and link substate PK=FK
+        _attach_substate(database_session, base, state)
+
+        return row
+
+    @property
+    def state(self) -> SQLModel | None:
+        """Return the concrete substate instance (e.g., NIMBUSSaveState)...
+
+        Return the concrete substate instance (e.g., NIMBUSSaveState)
+        resolved from the stored `base_state`.
+        """
+        if self.base_state is None:
+            return None
+        table: SQLModel | None = KIND_TO_TABLE.get(self.base_state.kind)
+
+        if table is None:
+            return None
+
+        db_session = object_session(self)
+
+        if db_session is None:
+            # No bound state
+            raise RuntimeError("StateDB.state accessed without a bound Session")
+
+        return db_session.exec(select(table).where(table.id == self.base_state.id)).first()
+
+
+KIND_TO_TABLE: dict[StateKind, SQLModel] = {
+    StateKind.RPM_SOLVE: RPMState,
+    StateKind.NIMBUS_SOLVE: NIMBUSClassificationState,
+    StateKind.NIMBUS_SAVE: NIMBUSSaveState,
+    StateKind.NIMBUS_INIT: NIMBUSInitializationState,
+    StateKind.NIMBUS_FINAL: NIMBUSFinalState,
+    StateKind.EMO_RUN: EMOIterateState,
+    StateKind.GNIMBUS_OPTIMIZE: GNIMBUSOptimizationState,
+    StateKind.GNIMBUS_VOTE: GNIMBUSVotingState,
+    StateKind.GNIMBUS_END: GNIMBUSEndState,
+    StateKind.EMO_SAVE: EMOSaveState,
+    StateKind.EMO_FETCH: EMOFetchState,
+    StateKind.EMO_SCORE: EMOSCOREState,
+    StateKind.GENERIC_INTERMEDIATE: IntermediateSolutionState,
+    StateKind.ENAUTILUS_STEP: ENautilusState,
+    StateKind.ENAUTILUS_FINAL: ENautilusFinalState,
+    StateKind.NAUTILUS_NAVIGATE: NautilusNavigatorNavigationState,
+    StateKind.NAUTILUS_INITIALIZE: NautilusNavigatorInitializationState,
+    StateKind.XNIMBUS_SOLVE: NIMBUSClassificationState,
+    StateKind.XNIMBUS_SAVE: NIMBUSSaveState,
+    StateKind.XNIMBUS_INIT: NIMBUSInitializationState,
+    StateKind.XNIMBUS_FINAL: NIMBUSFinalState,
+    StateKind.CUMULUS_SOLVE: CumulusClassificationState,
+    StateKind.CUMULUS_SAVE: CumulusSaveState,
+    StateKind.CUMULUS_INIT: CumulusInitializationState,
+    StateKind.CUMULUS_FINAL: CumulusFinalState,
+    StateKind.CUMULUS_MODIFY: CumulusModificationState,
+    StateKind.CUMULUS_OBJ_CONSTRAINT: CumulusObjectiveConstraintState,
+}
+
+SUBSTATE_TO_KIND: dict[SQLModel, StateKind] = {
+    RPMState: StateKind.RPM_SOLVE,
+    NIMBUSClassificationState: StateKind.NIMBUS_SOLVE,
+    NIMBUSSaveState: StateKind.NIMBUS_SAVE,
+    NIMBUSInitializationState: StateKind.NIMBUS_INIT,
+    NIMBUSFinalState: StateKind.NIMBUS_FINAL,
+    EMOIterateState: StateKind.EMO_RUN,
+    GNIMBUSOptimizationState: StateKind.GNIMBUS_OPTIMIZE,
+    GNIMBUSVotingState: StateKind.GNIMBUS_VOTE,
+    GNIMBUSEndState: StateKind.GNIMBUS_END,
+    EMOSaveState: StateKind.EMO_SAVE,
+    EMOFetchState: StateKind.EMO_FETCH,
+    EMOSCOREState: StateKind.EMO_SCORE,
+    IntermediateSolutionState: StateKind.GENERIC_INTERMEDIATE,
+    ENautilusState: StateKind.ENAUTILUS_STEP,
+    ENautilusFinalState: StateKind.ENAUTILUS_FINAL,
+    NautilusNavigatorNavigationState: StateKind.NAUTILUS_NAVIGATE,
+    NautilusNavigatorInitializationState: StateKind.NAUTILUS_INITIALIZE,
+    CumulusClassificationState: StateKind.CUMULUS_SOLVE,
+    CumulusInitializationState: StateKind.CUMULUS_INIT,
+    CumulusFinalState: StateKind.CUMULUS_FINAL,
+    CumulusSaveState: StateKind.CUMULUS_SAVE,
+    CumulusModificationState: StateKind.CUMULUS_MODIFY,
+    CumulusObjectiveConstraintState: StateKind.CUMULUS_OBJ_CONSTRAINT,
+}
+
+
+def _method_phase_from_kind(kind: StateKind) -> tuple[str, str]:
+    """Split enum value back to (method, phase)."""
+    method, phase = kind.value.split(".", 1)
+    return method, phase
+
+
+def _attach_substate(session, base: State, sub: SQLModel | None) -> None:
+    """Persist base; link sub.id = base.id; persist sub."""
+    session.add(base)
+    session.flush()  # assigns base.id
+
+    if sub is not None:
+        sub.id = base.id
+        # Remove any orphaned substate row with this ID (can happen when a
+        # parent State was deleted without cascading to the substate table).
+        existing = session.get(type(sub), base.id)
+        if existing is not None:
+            session.delete(existing)
+            session.flush()
+        session.add(sub)
+        session.flush()
+
+
+class UserSavedSolutionDB(SQLModel, table=True):
+    """Database model of an archived solution."""
+
+    id: int | None = Field(primary_key=True, default=None)
+
+    name: str | None = Field(default=None, nullable=True)
+    objective_values: dict[str, float] = Field(sa_column=Column(JSON))
+    variable_values: dict[str, VariableType] = Field(sa_column=Column(JSON))
+    solution_index: int | None
+
+    # Links
+    user_id: int | None = Field(foreign_key="user.id", default=None)
+    problem_id: int | None = Field(foreign_key="problemdb.id", default=None)
+    origin_state_id: int | None = Field(
+        foreign_key="states.id", default=None
+    )  # the StateDB where this solution was generated
+    save_state_id: int | None = Field(
+        foreign_key="states.id", default=None
+    )  # the StateDB that explicitly created the save
+
+    # Back populates
+    user: "User" = Relationship(back_populates="archive")
+    problem: "ProblemDB" = Relationship(back_populates="solutions")
+
+    @classmethod
+    def from_state_info(
+        cls,
+        database_session: Session,
+        user_id: int,
+        problem_id: int,
+        state_id: int,
+        solution_index: int,
+        name: str | None,
+    ) -> "UserSavedSolutionDB | None":
+        """Initialize based on state info.
+
+        Args:
+            database_session (Session): a database session.
+            user_id (int): user id.
+            problem_id (int): problem id.
+            state_id (int): id of state from which to initialize.
+            solution_index (int): the index of the solution to be saved, this assumes that
+            the referenced state enumerates multiple solutions.
+            name (str | None): name given to the saved solution.
+
+        Returns:
+            UserSavedSolutionDB | None: `None` if no state with `state_id` is found. Otherwise
+                returns the saved solution.
+        """
+        state = database_session.exec(
+            select(StateDB).where(
+                StateDB.id == state_id,
+                StateDB.problem_id == problem_id,
+            )
+        ).first()
+
+        if state is None:
+            return None
+
+        objective_values = state.state.result_objective_values[solution_index]
+        variable_values = state.state.result_variable_values[solution_index]
+
+        return cls(
+            name=name,
+            objective_values=objective_values,
+            variable_values=variable_values,
+            solution_index=solution_index,
+            user_id=user_id,
+            problem_id=problem_id,
+            origin_state_id=state_id,
+        )
+
+
+class SolutionReferenceBase(SQLModel):
+    """A model that functions as a reference to solutions existing in the database.
+
+    Referenced solutions are not necessarily solutions that the user has saved explicitly. For
+    referencing those, see `SavedSolutionReference`.
+    """
+
+    name: str | None = Field(description="Optional name to help identify the solution if, e.g., saved.", default=None)
+    solution_index: int | None = Field(
+        description="The index of the referenced solution, if multiple solutions exist in the reference state.",
+        default=None,
+    )
+    state: StateDB = Field(description="The reference state with the solution information.")
+
+    @computed_field
+    @property
+    def state_id(self) -> int:
+        """The state id."""
+        return self.state.id
+
+    @computed_field
+    @property
+    def num_solutions(self) -> int:
+        """Number of solutions contained in the referenced state."""
+        return len(self.state.state.solver_results)
+
+
+class SolutionReference(SolutionReferenceBase):
+    """A full solution reference with objectives and variables."""
+
+    @computed_field
+    @property
+    def objective_values_all(self) -> list[dict[str, float]]:
+        """All the objective values of the result."""
+        return self.state.state.result_objective_values
+
+    @computed_field
+    @property
+    def variable_values_all(self) -> list[dict[str, VariableType | Tensor]]:
+        """All the variable values of the result."""
+        return self.state.state.result_variable_values
+
+    @computed_field
+    @property
+    def objective_values(self) -> dict[str, float] | None:
+        """The objective values of the referenced solution. None if not applicable."""
+        if self.solution_index is not None:
+            return self.state.state.result_objective_values[self.solution_index]
+
+        return None
+
+    @computed_field
+    @property
+    def variable_values(self) -> dict[str, VariableType | Tensor] | None:
+        """The variable values of the referenced solution. None if not apllicable."""
+        if self.solution_index is not None:
+            return self.state.state.result_variable_values[self.solution_index]
+
+        return None
+
+
+class SolutionReferenceLite(SolutionReferenceBase):
+    """The same as SolutionReference, but without decision variables for more efficient transport over the internet."""
+
+    @computed_field
+    @property
+    def objective_values(self) -> dict[str, float] | None:
+        """The objective values of the referenced solution. None if not applicable."""
+        if self.solution_index is not None:
+            return self.state.state.result_objective_values[self.solution_index]
+
+        return None
+
+
+class SolutionReferenceResponse(SQLModel):
+    """The response information provided when `SolutionReference` object are returned from the client."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    name: str | None = Field(default=None)
+    solution_index: int | None
+    state_id: int
+    objective_values: dict[str, float] | None
+    variable_values: dict[str, "VariableType | Tensor"] | None
+
+
+class SavedSolutionReference(SQLModel):
+    """A model that functions as a reference to solutions that users have chosen to explicitly save in the database."""
+
+    saved_solution: UserSavedSolutionDB = Field(description="The reference object with the solution information.")
+
+    @computed_field
+    @property
+    def name(self) -> str | None:
+        """Name of the saved solution."""
+        return self.saved_solution.name
+
+    @computed_field
+    @property
+    def objective_values(self) -> dict[str, float]:
+        """Objective values of the saved solution."""
+        return self.saved_solution.objective_values
+
+    @computed_field
+    @property
+    def variable_values(self) -> dict[str, VariableType | Tensor]:
+        """Variable values of the saved solution."""
+        return self.saved_solution.variable_values
+
+    @computed_field
+    @property
+    def solution_index(self) -> int | None:
+        """The index of the saved solution."""
+        return self.saved_solution.solution_index
+
+    @computed_field
+    @property
+    def saved_solution_id(self) -> int:
+        """The id of the saved solution."""
+        return self.saved_solution.id
+
+    @computed_field
+    @property
+    def state_id(self) -> int | None:
+        """The origin state of the saved solution."""
+        return self.saved_solution.origin_state_id

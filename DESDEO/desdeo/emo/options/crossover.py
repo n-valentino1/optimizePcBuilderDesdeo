@@ -1,0 +1,209 @@
+"""JSON Schema for crossover operator options."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Literal
+
+from pydantic import BaseModel, Field
+
+from desdeo.emo.operators.crossover import (
+    BaseCrossover,
+    BlendAlphaCrossover,
+    BoundedExponentialCrossover,
+    CompositeCrossover,
+    LocalCrossover,
+    SimulatedBinaryCrossover,
+    SingleArithmeticCrossover,
+    SinglePointBinaryCrossover,
+    UniformIntegerCrossover,
+    UniformMixedIntegerCrossover,
+)
+
+if TYPE_CHECKING:
+    from desdeo.problem import Problem
+    from desdeo.tools.patterns import Publisher
+
+
+class SimulatedBinaryCrossoverOptions(BaseModel):
+    """Options for Simulated Binary Crossover (SBX)."""
+
+    name: Literal["SimulatedBinaryCrossover"] = Field(
+        default="SimulatedBinaryCrossover", frozen=True, description="The name of the crossover operator."
+    )
+    """The name of the crossover operator."""
+    pair_xover_probability: float = Field(
+        default=1.0, ge=0.0, le=1.0, description="Probability that a parent pair is recombined at all."
+    )
+    """Probability that a parent pair is recombined at all, drawn once per pair. On failure the pair is
+    copied to the offspring unchanged, with all of its decision variables kept together. This is the
+    `p_c` reported in the literature: 1.0 in the RVEA and NSGA-III papers, 0.9 in NSGA-II."""
+    xover_probability: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="The per-variable SBX crossover probability."
+    )
+    """The per-variable SBX crossover probability, drawn once per decision variable. Defaults to 0.5,
+    following Deb and Agrawal (1995): "we choose to perform SBX in each variable with probability 0.5".
+    This is a separate level from `pair_xover_probability`; the literature's `p_c` refers to the pair,
+    not to the variable, and belongs in `pair_xover_probability`."""
+    xover_distribution: float = Field(default=30.0, gt=0.0, description="The SBX distribution index.")
+    """The SBX distribution index."""
+    truncated: bool = Field(
+        default=True,
+        description=(
+            "Whether to truncate the probability distribution to keep the offspring within the variable bounds."
+        ),
+    )
+    """Whether to truncate the probability distribution to keep the offspring within the variable bounds."""
+    uniform_xover_probability: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="The uniform crossover probability."
+    )
+    """The uniform crossover probability. Only operates on variables that have already been selected for crossover
+    by the xover_probability parameter."""
+
+
+class SinglePointBinaryCrossoverOptions(BaseModel):
+    """Options for Single Point Binary Crossover."""
+
+    name: Literal["SinglePointBinaryCrossover"] = Field(
+        default="SinglePointBinaryCrossover", frozen=True, description="The name of the crossover operator."
+    )
+    """The name of the crossover operator."""
+
+
+class UniformIntegerCrossoverOptions(BaseModel):
+    """Options for Uniform Integer Crossover."""
+
+    name: Literal["UniformIntegerCrossover"] = Field(
+        default="UniformIntegerCrossover", frozen=True, description="The name of the crossover operator."
+    )
+    """The name of the crossover operator."""
+
+
+class UniformMixedIntegerCrossoverOptions(BaseModel):
+    """Options for Uniform Mixed Integer Crossover."""
+
+    name: Literal["UniformMixedIntegerCrossover"] = Field(
+        default="UniformMixedIntegerCrossover", frozen=True, description="The name of the crossover operator."
+    )
+    """The name of the crossover operator."""
+
+
+class BlendAlphaCrossoverOptions(BaseModel):
+    """Options for Blend Alpha Crossover."""
+
+    model_config = {"use_attribute_docstrings": True}
+
+    name: Literal["BlendAlphaCrossover"] = Field(
+        default="BlendAlphaCrossover",
+        frozen=True,
+    )
+    """The name of the crossover operator."""
+    alpha: float = Field(default=0.5, ge=0.0)
+    """
+    Non-negative blending factor 'alpha' that controls the extent to which offspring
+    may be sampled outside the interval defined by each pair of parent genes.
+    alpha = 0 restricts children strictly within the parents range, larger alpha allows outliers.
+    """
+    repeats: int = Field(default=2, ge=1)
+    """Number of offspring to generate per parent pair."""
+    sample_each_component: bool = Field(
+        default=True,
+    )
+    """If True, a new random number is generated for each component of the offspring. If False, a single random number
+    is generated for the entire offspring."""
+
+
+class SingleArithmeticCrossoverOptions(BaseModel):
+    """Options for Single Arithmetic Crossover."""
+
+    name: Literal["SingleArithmeticCrossover"] = Field(
+        default="SingleArithmeticCrossover", frozen=True, description="The name of the crossover operator."
+    )
+    """The name of the crossover operator."""
+    xover_probability: float = Field(default=1.0, ge=0.0, le=1.0, description="The crossover probability.")
+    """The crossover probability."""
+
+
+class LocalCrossoverOptions(BaseModel):
+    """Options for Local Crossover."""
+
+    name: Literal["LocalCrossover"] = Field(
+        default="LocalCrossover", frozen=True, description="The name of the crossover operator."
+    )
+    """The name of the crossover operator."""
+
+
+class BoundedExponentialCrossoverOptions(BaseModel):
+    """Options for Bounded Exponential Crossover."""
+
+    name: Literal["BoundedExponentialCrossover"] = Field(
+        default="BoundedExponentialCrossover", frozen=True, description="The name of the crossover operator."
+    )
+    """The name of the crossover operator."""
+    xover_probability: float = Field(default=1.0, ge=0.0, le=1.0, description="The crossover probability.")
+    """The crossover probability."""
+    lambda_: float = Field(default=0.1, gt=0.0, description="Positive scale λ for the exponential distribution.")
+    """Positive scale λ for the exponential distribution."""
+
+
+class CompositeCrossoverOptions(BaseModel):
+    """Options for Composite Crossover."""
+
+    name: Literal["CompositeCrossover"] = Field(
+        default="CompositeCrossover", frozen=True, description="The name of the crossover operator."
+    )
+    """The name of the crossover operator."""
+    crossovers: list[CrossoverOptions] = Field(
+        default_factory=list,
+        description="List of crossover options to be used in the composite crossover.",
+    )
+    """List of crossover options to be used in the composite crossover."""
+
+
+CrossoverOptions = (
+    SimulatedBinaryCrossoverOptions
+    | SinglePointBinaryCrossoverOptions
+    | UniformIntegerCrossoverOptions
+    | UniformMixedIntegerCrossoverOptions
+    | BlendAlphaCrossoverOptions
+    | SingleArithmeticCrossoverOptions
+    | LocalCrossoverOptions
+    | BoundedExponentialCrossoverOptions
+    | CompositeCrossoverOptions
+)
+
+
+def crossover_constructor(
+    problem: Problem, publisher: Publisher, seed: int, verbosity: int, options: CrossoverOptions
+) -> BaseCrossover:
+    """Construct a crossover operator.
+
+    Args:
+        problem (Problem): The optimization problem to solve.
+        publisher (Publisher): The publisher for communication.
+        seed (int): The random seed for reproducibility.
+        verbosity (int): The verbosity level of the output.
+        options (CrossoverOptions): The options for the crossover operator.
+
+    Returns:
+        BaseCrossover: The constructed crossover operator.
+    """
+    crossover_types = {
+        "SimulatedBinaryCrossover": SimulatedBinaryCrossover,
+        "SinglePointBinaryCrossover": SinglePointBinaryCrossover,
+        "UniformIntegerCrossover": UniformIntegerCrossover,
+        "UniformMixedIntegerCrossover": UniformMixedIntegerCrossover,
+        "BlendAlphaCrossover": BlendAlphaCrossover,
+        "SingleArithmeticCrossover": SingleArithmeticCrossover,
+        "LocalCrossover": LocalCrossover,
+        "BoundedExponentialCrossover": BoundedExponentialCrossover,
+        "CompositeCrossover": CompositeCrossover,
+    }
+    if options.name != "CompositeCrossover":
+        options = options.model_dump()
+        name = options.pop("name")
+        return crossover_types[name](problem=problem, publisher=publisher, seed=seed, verbosity=verbosity, **options)
+
+    sub_crossovers = [crossover_constructor(problem, publisher, seed, verbosity, c) for c in options.crossovers]
+    return CompositeCrossover(
+        problem=problem, publisher=publisher, verbosity=verbosity, operators=sub_crossovers, seed=seed
+    )

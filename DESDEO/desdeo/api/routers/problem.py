@@ -1,0 +1,683 @@
+"""Defines end-points to access and manage problems."""
+
+import json
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, status
+from fastapi.responses import JSONResponse
+from sqlmodel import Session, select
+
+from desdeo.api.db import get_session
+from desdeo.api.models import (
+    ConstrainedVariantRequest,
+    ConstrainedVariantResponse,
+    ForestProblemMetaData,
+    ProblemDB,
+    ProblemInfo,
+    ProblemInfoSmall,
+    Group,
+    ProblemMetaDataDB,
+    ProblemMetaDataGetRequest,
+    ProblemSelectSolverRequest,
+    RepresentativeNonDominatedSolutions,
+    SiteSelectionMetaData,
+    SolverSelectionMetadata,
+    User,
+    UserRole,
+)
+from desdeo.api.models.representative_solution import (
+    RepresentativeSolutionSetBase,
+    RepresentativeSolutionSetFull,
+    RepresentativeSolutionSetInfo,
+)
+from desdeo.api.routers.user_authentication import get_current_user
+from desdeo.problem import Problem
+from desdeo.problem.schema import Constraint, ConstraintTypeEnum, TensorVariable
+from desdeo.tools.utils import available_solvers
+
+from .utils import ContextField, SessionContext, SessionContextGuard
+
+router = APIRouter(prefix="/problem")
+
+
+def check_solver(problem_db: ProblemDB):
+    """Check if a preferred solver is set in the metadata.
+
+    Check if a preferred solver is set in the metadata.
+    If it exist, fetch its constructor and return it. Otherwise return None.
+    """
+    metadata: ProblemMetaDataDB = problem_db.problem_metadata
+    solver_metadata = None
+    if metadata is not None:
+        solver_metadata_list = [
+            metadata for metadata in metadata.all_metadata if metadata.metadata_type == "solver_selection_metadata"
+        ]
+        if solver_metadata_list != []:
+            solver_metadata = solver_metadata_list[-1]
+
+    if solver_metadata is not None:
+        solver = available_solvers[solver_metadata.solver_string_representation]["constructor"]
+    else:
+        solver = None
+    return solver
+
+
+# This is needed, because otherwise fields ending in an underscore fail to parse.
+async def parse_problem_json(request: Request) -> Problem:
+    """Helper function to pass by_name=True to model_validate when coercing the json object to a Problem object."""
+    data: dict = await request.json()
+    return Problem.model_validate(data, by_name=True)
+
+
+@router.get("/all")
+def get_problems(
+    user: Annotated[User, Depends(get_current_user)],
+    db_session: Annotated[Session, Depends(get_session)],
+) -> list[ProblemInfoSmall]:
+    """Get information on problems. Analysts and admins see all users' problems.
+
+    Args:
+        user (Annotated[User, Depends): the current user.
+        db_session (Annotated[Session, Depends]): the database session.
+
+    Returns:
+        list[ProblemInfoSmall]: a list of information on the problems.
+    """
+    if user.role in (UserRole.analyst, UserRole.admin):
+        return list(db_session.exec(select(ProblemDB)).all())
+
+    problems_by_id: dict[int, ProblemDB] = {problem.id: problem for problem in user.problems}
+
+    groups = db_session.exec(select(Group)).all()
+    visible_group_problem_ids = {
+        group.problem_id
+        for group in groups
+        if user.id == group.owner_id or user.id in (group.user_ids or [])
+    }
+    if visible_group_problem_ids:
+        group_problems = db_session.exec(select(ProblemDB).where(ProblemDB.id.in_(visible_group_problem_ids))).all()
+        for problem in group_problems:
+            problems_by_id[problem.id] = problem
+
+    return list(problems_by_id.values())
+
+
+@router.get("/all_info")
+def get_problems_info(
+    user: Annotated[User, Depends(get_current_user)],
+    db_session: Annotated[Session, Depends(get_session)],
+) -> list[ProblemInfo]:
+    """Get detailed information on problems. Analysts and admins see all users' problems.
+
+    Args:
+        user (Annotated[User, Depends): the current user.
+        db_session (Annotated[Session, Depends]): the database session.
+
+    Returns:
+        list[ProblemInfo]: a list of the detailed information on the problems.
+    """
+    if user.role in (UserRole.analyst, UserRole.admin):
+        return list(db_session.exec(select(ProblemDB)).all())
+
+    problems_by_id: dict[int, ProblemDB] = {problem.id: problem for problem in user.problems}
+
+    groups = db_session.exec(select(Group)).all()
+    visible_group_problem_ids = {
+        group.problem_id
+        for group in groups
+        if user.id == group.owner_id or user.id in (group.user_ids or [])
+    }
+    if visible_group_problem_ids:
+        group_problems = db_session.exec(select(ProblemDB).where(ProblemDB.id.in_(visible_group_problem_ids))).all()
+        for problem in group_problems:
+            problems_by_id[problem.id] = problem
+
+    return list(problems_by_id.values())
+
+
+@router.get("/{problem_id}")
+def get_problem(
+    problem_id: int,
+    context: Annotated[
+        SessionContext,
+        Depends(SessionContextGuard(require=[ContextField.PROBLEM]).get),
+    ],
+) -> ProblemInfo:
+    """Get a specific problem by id.
+
+    Args:
+         problem_id (int): problem id.
+         context (Annotated[SessionContext, Depends): the session context.
+
+    Raises:
+         HTTPException: could not find a problem with the given id.
+
+    Returns:
+         ProblemInfo: detailed information on the requested problem.
+    """
+    return context.problem_db
+
+
+@router.post("/add")
+def add_problem(
+    request: Annotated[Problem, Depends(parse_problem_json)],
+    context: Annotated[SessionContext, Depends(SessionContextGuard().post)],
+    target_user_id: int | None = None,
+) -> ProblemInfo:
+    """Add a newly defined problem to the database.
+
+    Args:
+        request (Problem): the JSON representation of the problem.
+        context (Annotated[SessionContext, Depends): the session context.
+        target_user_id (int | None): if provided, assign the problem to this user instead of
+            the caller. Only analysts and admins may use this parameter.
+
+    Note:
+        Users with the role 'guest' may not add new problems.
+
+    Raises:
+        HTTPException: when any issue with defining the problem arises.
+
+    Returns:
+        ProblemInfo: the information about the problem added.
+    """
+    user = context.user
+    db_session = context.db_session
+
+    if user.role == UserRole.guest:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Guest users are not allowed to add new problems.",
+        )
+
+    effective_user = user
+    if target_user_id is not None:
+        if user.role not in (UserRole.analyst, UserRole.admin):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only analysts and admins can add problems on behalf of other users.",
+            )
+        effective_user = db_session.get(User, target_user_id)
+        if effective_user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with id={target_user_id} not found.",
+            )
+
+    try:
+        problem_db = ProblemDB.from_problem(request, user=effective_user)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not add problem. Possible reason: {e!r}",
+        ) from e
+
+    db_session.add(problem_db)
+    db_session.commit()
+    db_session.refresh(problem_db)
+
+    return problem_db
+
+
+@router.post("/add_json")
+def add_problem_json(
+    json_file: UploadFile,
+    context: Annotated[SessionContext, Depends(SessionContextGuard().post)],
+    target_user_id: int | None = None,
+) -> ProblemInfo:
+    """Adds a problem to the database based on its JSON definition.
+
+    Args:
+        json_file (UploadFile): a file in JSON format describing the problem.
+        context (Annotated[SessionContext, Depends): the session context.
+        target_user_id (int | None): if provided, assign the problem to this user instead of
+            the caller. Only analysts and admins may use this parameter.
+
+    Raises:
+        HTTPException: if the provided `json_file` is empty.
+        HTTPException: if the content in the provided `json_file` is not in JSON format.__annotations__
+
+    Returns:
+        ProblemInfo: a description of the added problem.
+    """
+    user = context.user
+    db_session = context.db_session
+
+    effective_user = user
+    if target_user_id is not None:
+        if user.role not in (UserRole.analyst, UserRole.admin):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only analysts and admins can add problems on behalf of other users.",
+            )
+        effective_user = db_session.get(User, target_user_id)
+        if effective_user is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"User with id={target_user_id} not found.",
+            )
+
+    raw = json_file.file.read()
+
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+
+    try:
+        json.loads(raw)  # extra validation
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON.") from e
+
+    problem = Problem.model_validate_json(raw, by_name=True)
+    problem_db = ProblemDB.from_problem(problem, user=effective_user)
+
+    db_session.add(problem_db)
+    db_session.commit()
+    db_session.refresh(problem_db)
+
+    return problem_db
+
+
+@router.post("/get_metadata")
+def get_metadata(
+    request: ProblemMetaDataGetRequest,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[]).post)],
+) -> list[
+    ForestProblemMetaData | RepresentativeNonDominatedSolutions | SolverSelectionMetadata | SiteSelectionMetaData
+]:
+    """Fetch specific metadata for a specific problem.
+
+    Fetch specific metadata for a specific problem. See all the possible
+    metadata types from DESDEO/desdeo/api/models/problem.py Problem Metadata
+    section.
+
+    Args:
+        request (MetaDataGetRequest): the requested metadata type.
+        context (Annotated[SessionContext, Depends]): the session context.
+
+    Returns:
+        list[ForestProblemMetadata | RepresentativeNonDominatedSolutions]: list containing all the metadata
+            defined for the problem with the requested metadata type. If no match is found,
+            returns an empty list.
+    """
+    problem_db = context.db_session.get(ProblemDB, request.problem_id)
+    if not problem_db:
+        raise HTTPException(status_code=404, detail=f"Problem with ID {request.problem_id} not found!")
+
+    problem_metadata = problem_db.problem_metadata
+
+    if problem_metadata is None:
+        # no metadata define for the problem
+        return []
+    # metadata is defined, try to find matching types based on request
+    return [metadata for metadata in problem_metadata.all_metadata if metadata.metadata_type == request.metadata_type]
+
+
+@router.get("/assign/solver", response_model=list[str])
+def get_available_solvers() -> list[str]:
+    """Return the list of available solver names."""
+    return list(available_solvers.keys())
+
+
+@router.post("/assign_solver")
+def select_solver(
+    request: ProblemSelectSolverRequest,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[ContextField.PROBLEM]).post)],
+) -> JSONResponse:
+    """Assign a specific solver for a problem.
+
+    Args:
+        request: ProblemSelectSolverRequest: The request containing problem id and string representation of the solver
+        context: Annotated[SessionContext, Depends(get_session)]: The session context.
+
+    Raises:
+        HTTPException: Unknown solver, unauthorized user
+
+    Returns:
+        JSONResponse: A simple confirmation.
+    """
+    db_session = context.db_session
+    user = context.user
+    problem_db = context.problem_db  # guaranteed
+
+    # Validate solver type
+    if request.solver_string_representation not in [x for x, _ in available_solvers.items()]:
+        raise HTTPException(
+            detail=f"Solver of unknown type: {request.solver_string_representation}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    # Auth the user
+    if user.role not in (UserRole.analyst, UserRole.admin) and user.id != problem_db.user_id:
+        raise HTTPException(
+            detail="Unauthorized user!",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+    # All good, get on with it.
+    problem_metadata = problem_db.problem_metadata or ProblemMetaDataDB(problem_id=problem_db.id, problem=problem_db)
+    db_session.add(problem_metadata)
+    db_session.commit()
+    db_session.refresh(problem_metadata)
+
+    # Remove existing solver selection metadata
+    if problem_metadata.solver_selection_metadata:
+        db_session.delete(problem_metadata.solver_selection_metadata[-1])
+        db_session.commit()
+
+    # Add new solver selection metadata
+    solver_selection_metadata = SolverSelectionMetadata(
+        metadata_id=problem_metadata.id,
+        solver_string_representation=request.solver_string_representation,
+        metadata_instance=problem_metadata,
+    )
+
+    db_session.add(solver_selection_metadata)
+    db_session.commit()
+    db_session.refresh(solver_selection_metadata)
+
+    problem_metadata.solver_selection_metadata.append(solver_selection_metadata)
+    db_session.add(problem_metadata)
+    db_session.commit()
+    db_session.refresh(problem_metadata)
+
+    return JSONResponse(content={"message": "OK"}, status_code=status.HTTP_200_OK)
+
+
+@router.post("/{problem_id}/add_representative_solution_set")
+def add_representative_solution_set(
+    problem_id: int,
+    request: RepresentativeSolutionSetBase,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[ContextField.PROBLEM]).post)],
+):
+    """Add a new representative solution set as metadata to a problem.
+
+    Args:
+        problem_id: int,
+        request (RepresentativeSolutionSetBase): The JSON body containing the
+            details of the representative solution set (name, description, solution data, ideal, nadir).
+        context (SessionContext): The session context providing the current user and database session.
+
+    Raises:
+        HTTPException: If problem not found or unauthorized user.
+
+    Returns:
+        RepresentativeSolutionSetInfo: information about the added set.
+    """
+    db_session: Session = context.db_session
+    problem_db = context.problem_db
+
+    problem_metadata = problem_db.problem_metadata or ProblemMetaDataDB(problem_id=problem_db.id, problem=problem_db)
+    db_session.add(problem_metadata)
+    db_session.commit()
+    db_session.refresh(problem_metadata)
+
+    # Add new representative solution set
+    repr_metadata = RepresentativeNonDominatedSolutions(
+        metadata_id=problem_metadata.id,
+        name=request.name,
+        description=request.description,
+        solution_data=request.solution_data,
+        ideal=request.ideal,
+        nadir=request.nadir,
+        metadata_instance=problem_metadata,
+    )
+
+    db_session.add(repr_metadata)
+    db_session.commit()
+    db_session.refresh(repr_metadata)
+
+    return RepresentativeSolutionSetInfo(
+        id=repr_metadata.id,
+        problem_id=problem_db.id,
+        name=repr_metadata.name,
+        description=repr_metadata.description,
+        ideal=repr_metadata.ideal,
+        nadir=repr_metadata.nadir,
+    )
+
+
+@router.get("/{problem_id}/all_representative_solution_sets")
+def get_all_representative_solution_sets(
+    problem_id: int,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[]).get)],
+):
+    """Get meta information about all representative solution sets for a given problem.
+
+    Returns only name, description, ideal, and nadir for each set.
+    """
+    db_session: Session = context.db_session
+    user = context.user
+
+    # Fetch problem
+    problem_db = db_session.get(ProblemDB, problem_id)
+    if not problem_db:
+        raise HTTPException(status_code=404, detail=f"Problem with ID {problem_id} not found.")
+
+    # Check the user
+    if user.role not in (UserRole.analyst, UserRole.admin) and problem_db.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized user.")
+
+    # Fetch metadata
+    problem_metadata = problem_db.problem_metadata
+    if not problem_metadata:
+        return []
+
+    # Build response
+    return [
+        RepresentativeSolutionSetInfo(
+            id=rep.id,
+            problem_id=problem_id,
+            name=rep.name,
+            description=rep.description,
+            ideal=rep.ideal,
+            nadir=rep.nadir,
+        )
+        for rep in problem_metadata.representative_nd_metadata
+    ]
+
+
+@router.get("/representative_solution_set/{set_id}")
+def get_representative_solution_set(
+    set_id: int,
+    context: Annotated[SessionContext, Depends(SessionContextGuard().get)],
+):
+    """Fetch full information of a single representative solution set by its ID."""
+    db_session: Session = context.db_session
+
+    # Fetch the representative set
+    repr_set = db_session.get(RepresentativeNonDominatedSolutions, set_id)
+    if repr_set is None:
+        raise HTTPException(status_code=404, detail=f"Representative set with ID {set_id} not found.")
+
+    # Check the user
+    if (
+        context.user.role not in (UserRole.analyst, UserRole.admin)
+        and repr_set.metadata_instance.problem.user_id != context.user.id
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized user.")
+
+    # Return all fields as a dict
+    return RepresentativeSolutionSetFull(
+        id=repr_set.id,
+        problem_id=repr_set.metadata_instance.problem_id,
+        name=repr_set.name,
+        description=repr_set.description,
+        solution_data=repr_set.solution_data,
+        ideal=repr_set.ideal,
+        nadir=repr_set.nadir,
+    )
+
+
+@router.delete("/representative_solution_set/{set_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_representative_solution_set(
+    set_id: int,
+    context: Annotated[SessionContext, Depends(SessionContextGuard().delete)],
+):
+    """Delete a representative solution set by its ID."""
+    db_session: Session = context.db_session
+    user = context.user
+
+    # Fetch the set
+    repr_metadata = db_session.get(RepresentativeNonDominatedSolutions, set_id)
+    if repr_metadata is None:
+        raise HTTPException(status_code=404, detail=f"Representative solution set with ID {set_id} not found.")
+
+    # Ensure the user owns the problem this set belongs to (analysts/admins are exempt)
+    problem_metadata = repr_metadata.metadata_instance
+    if user.role not in (UserRole.analyst, UserRole.admin) and problem_metadata.problem.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized user.")
+
+    # Delete the set
+    db_session.delete(repr_metadata)
+    db_session.commit()
+
+
+@router.delete("/{problem_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_problem(
+    problem_id: int,
+    context: Annotated[SessionContext, Depends(SessionContextGuard().delete)],
+):
+    """Delete a problem by its ID.
+
+    Temporary problems (is_temporary=True) can be deleted by their owner.
+    Non-temporary problems can only be deleted by admin users.
+    """
+    db_session: Session = context.db_session
+    user = context.user
+
+    problem_db = db_session.get(ProblemDB, problem_id)
+    if problem_db is None:
+        raise HTTPException(status_code=404, detail=f"Problem with ID {problem_id} not found.")
+
+    # Role hierarchy for deletion: admin > analyst > dm > guest.
+    # Users can delete their own problems or problems owned by lower-role users.
+    _role_rank = {UserRole.guest: 0, UserRole.dm: 1, UserRole.analyst: 2, UserRole.admin: 3}
+    is_own = problem_db.user_id == user.id
+    outranks_owner = _role_rank.get(user.role, 0) > _role_rank.get(problem_db.user.role, 0)
+    if not (is_own or outranks_owner):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized user.")
+
+    db_session.delete(problem_db)
+    db_session.commit()
+
+
+@router.get("/{problem_id}/json")
+def get_problem_json(
+    problem_id: int,
+    context: Annotated[SessionContext, Depends(SessionContextGuard().get)],
+) -> JSONResponse:
+    """Return a Problem as a serialized JSON object suitable for download/re-upload."""
+    db_session: Session = context.db_session
+    user = context.user
+
+    problem_db = db_session.get(ProblemDB, problem_id)
+    if problem_db is None:
+        raise HTTPException(status_code=404, detail=f"Problem with ID {problem_id} not found.")
+
+    if user.role not in (UserRole.analyst, UserRole.admin) and problem_db.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized user.")
+
+    problem = Problem.from_problemdb(problem_db)
+    return JSONResponse(content=json.loads(problem.model_dump_json()), status_code=status.HTTP_200_OK)
+
+
+@router.post("/{problem_id}/constrained_variant")
+def create_constrained_variant(
+    problem_id: int,
+    request: ConstrainedVariantRequest,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[]).post)],
+) -> ConstrainedVariantResponse:
+    """Create a derived problem with additional EQ constraints fixing variables to specific values.
+
+    The original problem is not modified. The variant is stored as a new ProblemDB row
+    with parent_problem_id set to the original.
+    """
+    db_session: Session = context.db_session
+    user = context.user
+    problem_db = context.problem_db
+
+    if problem_db is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Problem with ID {problem_id} not found.")
+
+    if problem_db.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Unauthorized user.")
+
+    # Reconstruct in-memory Problem
+    problem = Problem.from_problemdb(problem_db)
+
+    # Build a mapping from valid variable symbols to their MathJSON reference expression.
+    # Scalar variables: "x" → "x" (plain symbol in MathJSON).
+    # Tensor variables: unrolled names like "sv_5" → ["At", "sv", 5, 1] (indexed access).
+    # Pyomo creates tensor variables with index sets for each dimension of the shape,
+    # so shape [60, 1] needs a 2D index (i, 1). Shape [3, 4] would enumerate all 12
+    # elements as sv_1..sv_12 in row-major order with 1-based Pyomo indices.
+    import itertools
+
+    var_symbol_to_expr: dict[str, str | list] = {}
+    for v in problem.variables:
+        if isinstance(v, TensorVariable):
+            # Enumerate all elements in row-major order (matching solver unrolling convention)
+            ranges = [range(1, dim + 1) for dim in v.shape]
+            for flat_idx, indices in enumerate(itertools.product(*ranges), start=1):
+                var_symbol_to_expr[f"{v.symbol}_{flat_idx}"] = ["At", v.symbol, *indices]
+        else:
+            var_symbol_to_expr[v.symbol] = v.symbol
+
+    new_constraints = []
+    for i, fixing in enumerate(request.variable_fixings):
+        if fixing.variable_symbol not in var_symbol_to_expr:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Variable symbol '{fixing.variable_symbol}' not found in problem. "
+                f"Available: {sorted(var_symbol_to_expr.keys())}",
+            )
+        var_expr = var_symbol_to_expr[fixing.variable_symbol]
+        new_constraints.append(
+            Constraint(
+                name=fixing.constraint_name or f"fix_{fixing.variable_symbol}_to_{fixing.fixed_value}",
+                symbol=f"_fix_{i}",
+                cons_type=ConstraintTypeEnum.EQ,
+                func=["Add", var_expr, -fixing.fixed_value],
+                is_linear=True,
+            )
+        )
+
+    # Create the variant (immutable copy with added constraints)
+    variant = problem.add_constraints(new_constraints)
+    variant_name = request.name or f"{problem_db.name} [variant]"
+    # Update the name on the frozen model
+    variant = variant.model_copy(update={"name": variant_name})
+
+    # Persist
+    variant_db = ProblemDB.from_problem(variant, user=user)
+    variant_db.is_temporary = request.is_temporary
+    variant_db.parent_problem_id = problem_id
+    db_session.add(variant_db)
+    db_session.commit()
+    db_session.refresh(variant_db)
+
+    # Copy solver selection metadata from parent so the variant uses the same solver
+    if problem_db.problem_metadata is not None:
+        parent_solver_meta = [
+            m for m in problem_db.problem_metadata.all_metadata if m.metadata_type == "solver_selection_metadata"
+        ]
+        if parent_solver_meta:
+            variant_metadata = ProblemMetaDataDB(problem_id=variant_db.id)
+            db_session.add(variant_metadata)
+            db_session.commit()
+            db_session.refresh(variant_metadata)
+
+            variant_solver = SolverSelectionMetadata(
+                metadata_id=variant_metadata.id,
+                solver_string_representation=parent_solver_meta[-1].solver_string_representation,
+            )
+            db_session.add(variant_solver)
+            db_session.commit()
+
+    return ConstrainedVariantResponse(
+        problem_id=variant_db.id,
+        parent_problem_id=problem_id,
+        name=variant_name,
+        is_temporary=variant_db.is_temporary,
+        n_constraints_added=len(new_constraints),
+    )

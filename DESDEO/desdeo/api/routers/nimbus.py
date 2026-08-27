@@ -1,0 +1,572 @@
+"""Defines end-points to access functionalities related to the NIMBUS method."""
+
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlmodel import select
+
+from desdeo.api.models import (
+    IntermediateSolutionRequest,
+    NIMBUSClassificationRequest,
+    NIMBUSClassificationResponse,
+    NIMBUSClassificationState,
+    NIMBUSDeleteSaveRequest,
+    NIMBUSDeleteSaveResponse,
+    NIMBUSFinalizeRequest,
+    NIMBUSFinalizeResponse,
+    NIMBUSFinalState,
+    NIMBUSInitializationRequest,
+    NIMBUSInitializationResponse,
+    NIMBUSInitializationState,
+    NIMBUSIntermediateSolutionResponse,
+    NIMBUSSaveRequest,
+    NIMBUSSaveResponse,
+    NIMBUSSaveState,
+    ReferencePoint,
+    SolutionReference,
+    SolutionReferenceResponse,
+    StateDB,
+    UserSavedSolutionDB,
+)
+from desdeo.api.models.generic import SolutionInfo
+from desdeo.api.models.generic_states import StateKind
+from desdeo.api.models.nimbus import NIMBUSMultiplierRequest, NIMBUSMultiplierResponse
+from desdeo.api.models.state import IntermediateSolutionState
+from desdeo.api.routers.generic import solve_intermediate
+from desdeo.api.routers.problem import check_solver
+from desdeo.explanations.lagrange import (
+    compute_tradeoffs,
+    determine_active_objectives,
+    filter_constraint_values,
+    filter_lagrange_multipliers,
+)
+from desdeo.mcdm.nimbus import generate_starting_point, solve_sub_problems
+from desdeo.problem import Problem
+from desdeo.tools import SolverResults
+
+from .utils import (
+    ContextField,
+    SessionContext,
+    SessionContextGuard,
+    collect_all_solutions,
+    collect_saved_solutions,
+    get_solver_results_at,
+)
+
+router = APIRouter(prefix="/method/nimbus")
+
+
+@router.post("/solve")
+def solve_solutions(
+    request: NIMBUSClassificationRequest,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[ContextField.PROBLEM]).post)],
+) -> NIMBUSClassificationResponse:
+    """Solve the problem using the NIMBUS method."""
+    db_session = context.db_session
+    user = context.user
+    problem_db = context.problem_db
+    interactive_session = context.interactive_session
+    parent_state = context.parent_state
+
+    solver = check_solver(problem_db=problem_db)
+    problem = Problem.from_problemdb(problem_db)
+
+    solver_results: list[SolverResults] = solve_sub_problems(
+        problem=problem,
+        current_objectives=request.current_objectives,
+        reference_point=request.preference.aspiration_levels,
+        num_desired=request.num_desired,
+        scalarization_options=request.scalarization_options,
+        solver=solver,
+        solver_options=request.solver_options,
+    )
+
+    nimbus_state = NIMBUSClassificationState(
+        preferences=request.preference,
+        scalarization_options=request.scalarization_options,
+        solver=request.solver,
+        solver_options=request.solver_options,
+        solver_results=solver_results,
+        current_objectives=request.current_objectives,
+        num_desired=request.num_desired,
+        previous_preferences=request.preference,  # why?
+    )
+
+    # create DB state and add it to the DB
+    state = StateDB.create(
+        database_session=db_session,
+        problem_id=problem_db.id,
+        session_id=interactive_session.id if interactive_session is not None else None,
+        parent_id=parent_state.id if parent_state is not None else None,
+        state=nimbus_state,
+    )
+
+    db_session.add(state)
+    db_session.commit()
+    db_session.refresh(state)
+
+    # Collect all current solutions
+    current_solutions: list[SolutionReference] = []
+    for i, _ in enumerate(solver_results):
+        current_solutions.append(SolutionReference(state=state, solution_index=i))
+
+    saved_solutions = collect_saved_solutions(user, request.problem_id, db_session)
+    all_solutions = collect_all_solutions(user, request.problem_id, db_session)
+
+    return NIMBUSClassificationResponse(
+        state_id=state.id,
+        previous_preference=request.preference,
+        previous_objectives=request.current_objectives,
+        current_solutions=current_solutions,
+        saved_solutions=saved_solutions,
+        all_solutions=all_solutions,
+    )
+
+
+@router.post("/initialize")
+def initialize(
+    request: NIMBUSInitializationRequest,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[ContextField.PROBLEM]).post)],
+) -> NIMBUSInitializationResponse:
+    """Initialize the problem for the NIMBUS method."""
+    db_session = context.db_session
+    user = context.user
+    problem_db = context.problem_db
+    interactive_session = context.interactive_session
+    parent_state = context.parent_state
+
+    solver = check_solver(problem_db=problem_db)
+    problem = Problem.from_problemdb(problem_db)
+
+    if isinstance(ref_point := request.starting_point, ReferencePoint):
+        starting_point = ref_point.aspiration_levels
+
+    elif isinstance(info := request.starting_point, SolutionInfo):
+        # fetch the solution
+        statement = select(StateDB).where(StateDB.id == info.state_id)
+        state = db_session.exec(statement).first()
+
+        if state is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"StateDB with index {info.state_id} could not be found."
+            )
+
+        starting_point = state.state.result_objective_values[info.solution_index]
+
+    else:
+        starting_point = None
+
+    start_result = generate_starting_point(
+        problem=problem,
+        reference_point=starting_point,
+        scalarization_options=request.scalarization_options,
+        solver=solver,
+        solver_options=request.solver_options,
+    )
+
+    initialization_state = NIMBUSInitializationState(
+        reference_point=starting_point,
+        scalarization_options=request.scalarization_options,
+        solver=request.solver,
+        solver_results=start_result,
+    )
+
+    # create DB state and add it to the DB
+    state = StateDB.create(
+        database_session=db_session,
+        problem_id=problem_db.id,
+        session_id=interactive_session.id if interactive_session else None,
+        parent_id=parent_state.id if parent_state else None,
+        state=initialization_state,
+    )
+
+    db_session.add(state)
+    db_session.commit()
+    db_session.refresh(state)
+
+    current_solutions = [SolutionReference(state=state, solution_index=0)]
+    saved_solutions = collect_saved_solutions(user, request.problem_id, db_session)
+    all_solutions = collect_all_solutions(user, request.problem_id, db_session)
+
+    return NIMBUSInitializationResponse(
+        state_id=state.id,
+        current_solutions=current_solutions,
+        saved_solutions=saved_solutions,
+        all_solutions=all_solutions,
+    )
+
+
+@router.post("/save")
+def save(
+    request: NIMBUSSaveRequest, context: Annotated[SessionContext, Depends(SessionContextGuard().post)]
+) -> NIMBUSSaveResponse:
+    """Save solutions."""
+    db_session = context.db_session
+    user = context.user
+    interactive_session = context.interactive_session
+    parent_state = context.parent_state
+
+    if request.parent_state_id is None:
+        parent_state = (
+            interactive_session.states[-1]
+            if (interactive_session is not None and len(interactive_session.states) > 0)
+            else None
+        )
+    else:
+        parent_state = db_session.exec(select(StateDB).where(StateDB.id == request.parent_state_id)).first()
+
+        if parent_state is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Could not find state with id={request.parent_state_id}"
+            )
+
+    # Check for duplicate solutions and update names instead of saving duplicates
+    updated_solutions: list[UserSavedSolutionDB] = []
+    new_solutions: list[UserSavedSolutionDB] = []
+
+    for info in request.solution_info:
+        existing_solution = db_session.exec(
+            select(UserSavedSolutionDB).where(
+                UserSavedSolutionDB.origin_state_id == info.state_id,
+                UserSavedSolutionDB.solution_index == info.solution_index,
+            )
+        ).first()
+
+        if existing_solution is not None:
+            existing_solution.name = info.name
+            db_session.add(existing_solution)
+            updated_solutions.append(existing_solution)
+
+        else:
+            new_solution = UserSavedSolutionDB.from_state_info(
+                db_session, user.id, request.problem_id, info.state_id, info.solution_index, info.name
+            )
+
+            db_session.add(new_solution)
+            new_solutions.append(new_solution)
+
+    # Commit existing and new solutions
+    if updated_solutions or new_solutions:
+        db_session.commit()
+        [db_session.refresh(row) for row in updated_solutions + new_solutions]
+
+    # save solver results for state in SolverResults format just for consistency
+    save_state = NIMBUSSaveState(solutions=updated_solutions + new_solutions)
+
+    # create DB state
+    state = StateDB.create(
+        database_session=db_session,
+        problem_id=request.problem_id,
+        session_id=interactive_session.id if interactive_session is not None else None,
+        parent_id=parent_state.id if parent_state is not None else None,
+        state=save_state,
+    )
+
+    db_session.add(state)
+    db_session.commit()
+    db_session.refresh(state)
+
+    return NIMBUSSaveResponse(state_id=state.id)
+
+
+@router.post("/intermediate")
+def solve_nimbus_intermediate(
+    request: IntermediateSolutionRequest,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[ContextField.PROBLEM]).post)],
+) -> NIMBUSIntermediateSolutionResponse:
+    """Solve intermediate solutions by forwarding the request to generic intermediate endpoint with context nimbus."""
+    db_session = context.db_session
+    user = context.user
+
+    # Add NIMBUS context to request
+    request.context = "nimbus"
+
+    # Forward to generic endpoint
+    intermediate_response = solve_intermediate(request, context)
+
+    # Get saved solutions for this user and problem
+    saved_solutions = collect_saved_solutions(user, request.problem_id, db_session)
+    # Get all solutions including the newly generated intermediate ones
+    all_solutions = collect_all_solutions(user, request.problem_id, db_session)
+
+    return NIMBUSIntermediateSolutionResponse(
+        state_id=intermediate_response.state_id,
+        reference_solution_1=intermediate_response.reference_solution_1.objective_values,
+        reference_solution_2=intermediate_response.reference_solution_2.objective_values,
+        current_solutions=intermediate_response.intermediate_solutions,
+        saved_solutions=saved_solutions,
+        all_solutions=all_solutions,
+    )
+
+
+@router.post("/get-or-initialize")
+def get_or_initialize(
+    request: NIMBUSInitializationRequest,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[ContextField.PROBLEM]).post)],
+) -> (
+    NIMBUSInitializationResponse
+    | NIMBUSClassificationResponse
+    | NIMBUSIntermediateSolutionResponse
+    | NIMBUSFinalizeResponse
+):
+    """Get the latest NIMBUS state if it exists, or initialize a new one if it doesn't."""
+    db_session = context.db_session
+    user = context.user
+    interactive_session = context.interactive_session
+
+    # Look for latest relevant state in the session
+    statement = (
+        select(StateDB)
+        .where(
+            StateDB.problem_id == request.problem_id,
+            StateDB.session_id == (interactive_session.id if interactive_session else user.active_session_id),
+        )
+        .order_by(StateDB.id.desc())
+    )
+    states = db_session.exec(statement).all()
+
+    # Find the latest relevant state (NIMBUS classification, initialization, or intermediate with NIMBUS context)
+    latest_state = None
+    for state in states:
+        if isinstance(state.state, (NIMBUSClassificationState | NIMBUSInitializationState | NIMBUSFinalState)) or (
+            isinstance(state.state, IntermediateSolutionState) and state.state.context == "nimbus"
+        ):
+            latest_state = state
+            break
+
+    if latest_state is not None:
+        saved_solutions = collect_saved_solutions(user, request.problem_id, db_session)
+        all_solutions = collect_all_solutions(user, request.problem_id, db_session)
+
+        solver_results = latest_state.state.solver_results
+        current_solutions = (
+            [SolutionReference(state=latest_state, solution_index=i) for i in range(len(solver_results))]
+            if isinstance(solver_results, list)
+            else [SolutionReference(state=latest_state, solution_index=0)]
+        )
+
+        if isinstance(latest_state.state, NIMBUSClassificationState):
+            return NIMBUSClassificationResponse(
+                state_id=latest_state.id,
+                previous_preference=latest_state.state.preferences,
+                previous_objectives=latest_state.state.current_objectives,
+                current_solutions=current_solutions,
+                saved_solutions=saved_solutions,
+                all_solutions=all_solutions,
+            )
+
+        if isinstance(latest_state.state, IntermediateSolutionState):
+            return NIMBUSIntermediateSolutionResponse(
+                state_id=latest_state.id,
+                reference_solution_1=latest_state.state.reference_solution_1,
+                reference_solution_2=latest_state.state.reference_solution_2,
+                current_solutions=current_solutions,
+                saved_solutions=saved_solutions,
+                all_solutions=all_solutions,
+            )
+
+        if isinstance(latest_state.state, NIMBUSFinalState):
+            solution_index = latest_state.state.solution_result_index
+            origin_state_id = latest_state.state.solution_origin_state_id
+
+            final_solution_ref_res = SolutionReferenceResponse(
+                solution_index=solution_index,
+                state_id=origin_state_id,
+                objective_values=latest_state.state.solver_results.optimal_objectives,
+                variable_values=latest_state.state.solver_results.optimal_variables,
+            )
+
+            return NIMBUSFinalizeResponse(
+                state_id=latest_state.id,
+                final_solution=final_solution_ref_res,
+                saved_solutions=saved_solutions,
+                all_solutions=all_solutions,
+            )
+        # NIMBUSInitializationState
+        return NIMBUSInitializationResponse(
+            state_id=latest_state.id,
+            current_solutions=current_solutions,
+            saved_solutions=saved_solutions,
+            all_solutions=all_solutions,
+        )
+
+    # No relevant state found, initialize a new one
+    return initialize(request, context)
+
+
+@router.post("/finalize")
+def finalize_nimbus(
+    request: NIMBUSFinalizeRequest,
+    context: Annotated[SessionContext, Depends(SessionContextGuard(require=[ContextField.PROBLEM]).post)],
+) -> NIMBUSFinalizeResponse:
+    """An endpoint for finishing up the nimbus process.
+
+    Args:
+        request (NIMBUSFinalizeRequest): The request containing the final solution, etc.
+        context (Annotated[SessionContext, SessionContextGuard): The current context.
+
+    Raises:
+        HTTPException
+
+    Returns:
+        NIMBUSFinalizeResponse: Response containing info on the final solution.
+    """
+    db_session = context.db_session
+    user = context.user
+    interactive_session = context.interactive_session
+    parent_state = context.parent_state
+    problem_db = context.problem_db
+
+    solution_state_id = request.solution_info.state_id
+    solution_index = request.solution_info.solution_index
+
+    state = db_session.exec(select(StateDB).where(StateDB.id == solution_state_id)).first()
+    actual_state = state.state if state else None
+    if actual_state is None:
+        raise HTTPException(
+            detail="No concrete substate!",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+    final_state = NIMBUSFinalState(
+        solution_origin_state_id=solution_state_id,
+        solution_result_index=solution_index,
+        solver_results=get_solver_results_at(actual_state, solution_index),
+    )
+
+    state = StateDB.create(
+        database_session=db_session,
+        problem_id=problem_db.id,
+        session_id=interactive_session.id if interactive_session is not None else None,
+        parent_id=parent_state.id if parent_state is not None else None,
+        state=final_state,
+    )
+
+    db_session.add(state)
+    db_session.commit()
+    db_session.refresh(state)
+
+    solution_reference_response = SolutionReferenceResponse(
+        solution_index=solution_index,
+        state_id=solution_state_id,
+        objective_values=final_state.solver_results.optimal_objectives,
+        variable_values=final_state.solver_results.optimal_variables,
+    )
+
+    return NIMBUSFinalizeResponse(
+        state_id=state.id,
+        final_solution=solution_reference_response,
+        saved_solutions=collect_saved_solutions(user=user, problem_id=problem_db.id, session=db_session),
+        all_solutions=collect_all_solutions(user=user, problem_id=problem_db.id, session=db_session),
+    )
+
+
+@router.post("/delete_save")
+def delete_save(
+    request: NIMBUSDeleteSaveRequest, context: Annotated[SessionContext, Depends(SessionContextGuard().post)]
+) -> NIMBUSDeleteSaveResponse:
+    """Endpoint for deleting saved solutions.
+
+    Args:
+        request (NIMBUSDeleteSaveRequest): request containing necessary information for deleting a save
+        context (Annotated[SessionContext, Depends): session context
+
+    Raises:
+        HTTPException
+
+    Returns:
+        NIMBUSDeleteSaveResponse: Response acknowledging the deletion of save and other useful info.
+    """
+    db_session = context.db_session
+
+    to_be_deleted = db_session.exec(
+        select(UserSavedSolutionDB).where(
+            UserSavedSolutionDB.origin_state_id == request.state_id,
+            UserSavedSolutionDB.solution_index == request.solution_index,
+        )
+    ).first()
+
+    if to_be_deleted is None:
+        raise HTTPException(detail="Unable to find a saved solution!", status_code=status.HTTP_404_NOT_FOUND)
+
+    db_session.delete(to_be_deleted)
+    db_session.commit()
+
+    to_be_deleted = db_session.exec(
+        select(UserSavedSolutionDB).where(
+            UserSavedSolutionDB.origin_state_id == request.state_id,
+            UserSavedSolutionDB.solution_index == request.solution_index,
+        )
+    ).first()
+
+    if to_be_deleted is not None:
+        raise HTTPException(
+            detail="Could not delete the saved solution!", status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+    return NIMBUSDeleteSaveResponse(message="Save deleted.")
+
+
+@router.post("/get-multipliers-info")
+def get_multipliers_info(
+    request: NIMBUSMultiplierRequest,
+    context: Annotated[SessionContext, Depends(SessionContextGuard().post)],
+) -> NIMBUSMultiplierResponse:
+    """Get Lagrange multipliers, tradeoffs, and active objectives from a state's solver results."""
+    db_session = context.db_session
+
+    state = db_session.exec(select(StateDB).where(StateDB.id == request.state_id)).first()
+
+    if state is None or not hasattr(state, "state"):
+        return NIMBUSMultiplierResponse(lagrange_multipliers=None)
+
+    actual_state = state.state
+    objective_symbols = request.objective_symbols
+
+    if not hasattr(actual_state, "solver_results") or actual_state.solver_results is None:
+        return NIMBUSMultiplierResponse(lagrange_multipliers=None)
+
+    lagrange_multipliers: list[dict[str, float] | None] = []
+    constraint_values: list[dict[str, float] | None] = []
+
+    # Handle states with multiple results (list of SolverResults)
+    results_list = (
+        actual_state.solver_results if isinstance(actual_state.solver_results, list) else [actual_state.solver_results]
+    )
+
+    for result in results_list:
+        if hasattr(result, "lagrange_multipliers") and result.lagrange_multipliers is not None:
+            lagrange_multipliers.append(filter_lagrange_multipliers(result.lagrange_multipliers, objective_symbols))
+            if hasattr(result, "constraint_values") and result.constraint_values is not None:
+                constraint_values.append(filter_constraint_values(result.constraint_values, objective_symbols))
+            else:
+                constraint_values.append(None)
+        else:
+            lagrange_multipliers.append(None)
+            constraint_values.append(None)
+
+    # Compute tradeoffs matrix for each solution
+    tradeoffs_list = [compute_tradeoffs(m) for m in lagrange_multipliers]
+
+    # Determine active objectives
+    active_objectives = determine_active_objectives(lagrange_multipliers, constraint_values, objective_symbols)
+
+    # Persist to state if it's a NIMBUS/XNIMBUS classification state
+    if (
+        isinstance(actual_state, NIMBUSClassificationState)
+        and state.base_state is not None
+        and state.base_state.kind
+        in (
+            StateKind.NIMBUS_SOLVE,
+            StateKind.XNIMBUS_SOLVE,
+        )
+    ):
+        actual_state.filtered_lagrange_multipliers = lagrange_multipliers
+        actual_state.tradeoffs_matrix = tradeoffs_list
+        db_session.add(actual_state)
+        db_session.commit()
+
+    return NIMBUSMultiplierResponse(
+        lagrange_multipliers=lagrange_multipliers,
+        tradeoffs_matrix=tradeoffs_list,
+        active_objectives=active_objectives,
+    )

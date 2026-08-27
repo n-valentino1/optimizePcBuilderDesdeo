@@ -1,0 +1,54 @@
+"""Defines user models."""
+
+from enum import Enum
+from typing import TYPE_CHECKING
+
+from sqlmodel import JSON, Column, Field, Relationship, SQLModel
+
+if TYPE_CHECKING:
+    from .archive import UserSavedSolutionDB
+    from .preference import PreferenceDB
+    from .problem import ProblemDB
+    from .scenario import ScenarioModelDB
+    from .session import InteractiveSessionDB
+
+
+class UserRole(str, Enum):
+    """Possible user roles."""
+
+    guest = "guest"
+    dm = "dm"
+    analyst = "analyst"
+    admin = "admin"
+
+
+class UserBase(SQLModel):
+    """Base user object."""
+
+    username: str = Field(index=True)
+
+
+class User(UserBase, table=True):
+    """The table model of the user stored in the database."""
+
+    id: int | None = Field(primary_key=True, default=None)
+    password_hash: str = Field()
+    role: UserRole = Field()
+    group: str | None = Field(default="") # TODO: Get rid of this and use proper group systems
+    group_ids: list[int] = Field(sa_column=Column(JSON), default=[]) # The user is either a member of a group or an owner of a group
+    active_session_id: int | None = Field(default=None)
+
+    # Back populates
+    archive: list["UserSavedSolutionDB"] = Relationship(back_populates="user")
+    preferences: list["PreferenceDB"] = Relationship(back_populates="user")
+    problems: list["ProblemDB"] = Relationship(back_populates="user")
+    scenario_models: list["ScenarioModelDB"] = Relationship(back_populates="user")
+    sessions: list["InteractiveSessionDB"] = Relationship(back_populates="user")
+
+
+class UserPublic(UserBase):
+    """The object to handle public user information."""
+
+    id: int
+    role: UserRole
+    group_ids: list[int] | None

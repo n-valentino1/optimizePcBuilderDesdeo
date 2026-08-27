@@ -1,0 +1,166 @@
+site_name: "DESDEO documentation"
+repo_url: "https://github.com/industrial-optimization-group/DESDEO"
+repo_name: "GitHub"
+docs_dir: "docs"
+site_dir: "site"
+site_url: "https://desdeo.readthedocs.io/en/latest/"
+
+nav:
+  - Home: "index.md"
+  - "DESDEO":
+      - "": "home/index.md"
+      - "About": "home/about.md"
+      - "The structure": "home/structure.md"
+      - "Implemented methods and features": "home/features.md"
+      - "Citing DESDEO": "home/citing.md"
+  - "Tutorials":
+      - "": "tutorials/index.md"
+      - "A primer on interactive multiobjective optimization": "tutorials/moo_primer.md"
+      - "Contributing to DESDEO": "tutorials/contributing.md"
+  - "Explanation":
+      - "": "explanation/index.md"
+      - "The problem format": "explanation/problem_format.ipynb"
+      - "Parsing and evaluating": "explanation/parsing_and_evaluating.ipynb"
+      - "Scalarization": "explanation/scalarization.ipynb"
+      - "Scalarization methods": "explanation/scalarization_methods.ipynb"
+      - "Simulator support": "explanation/simulator_support.ipynb"
+      - "Solvers": "explanation/solvers.ipynb"
+      - "Test problems": "explanation/test_problems.ipynb"
+      - "Evolutionary algorithms": "explanation/templates_and_pub_sub.ipynb"
+      - "Crossover operators": "explanation/crossover_operators.ipynb"
+      - "Scenarios": "explanation/scenarios.md"
+      - "Pydantic interface": "explanation/pydantic_interface.md"
+      - "Web-API models and schema": "explanation/database_models_and_schema.md"
+      - "Group decision making and websockets": "explanation/group_decision_making_and_websockets.md"
+  - "Guides":
+      - "": "howtoguides/index.md"
+      - "How to install DESDEO": "howtoguides/installing.md"
+      - "How to get started using DESDEO": "howtoguides/full_example.ipynb"
+      - "How to define a multiobjective optimization problem": "howtoguides/how_to_define_a_problem.ipynb"
+      - "How to host a DESDEO web application on Kubernetes": "howtoguides/kubernetes.md"
+      - "How to deploy DESDEO on OpenShift": "howtoguides/deploying_on_openshift.md"
+      - "How to run DESDEO's web-API and web-GUI": "howtoguides/api_and_gui.md"
+      - "How to solve problems with the web-GUI": "howtoguides/webui_solving_problems.md"
+      - "How to implement method interfaces in the Web-GUI": "howtoguides/implementing_method_interfaces.md"
+      - "How to utilize 'MCDM' methods": "howtoguides/how_to_utilize_mcdm_methods.ipynb"
+      - "How to use the NAUTILUS Navigator method": "howtoguides/nautilus_navigator.md"
+      - "How to use the NAUTILI method": "howtoguides/nautili.md"
+      - "How to use the Pareto navigator method": "howtoguides/pareto_navigator.md"
+      - "How to user evolutionary algorithms": "howtoguides/ea.ipynb"
+      - "How to configure evolutionary algorithms": "howtoguides/ea_options.ipynb"
+      - "How to solve constrained problems with evolutionary algorithms": "howtoguides/ea_constraints.ipynb"
+      - "How to implement evolutionary algorithms": "howtoguides/how_to_implement_ea.md"
+      - "How to use the XLEMOO method": "howtoguides/xlemoo.ipynb"
+      - "How to define problems with surrogates": "howtoguides/advancedSurrogates.ipynb"
+      - "How to use ADMS": "howtoguides/how_to_use_adms.ipynb"
+      - "How to use GDM score": "howtoguides/gdm_score.ipynb"
+      - "How to generate a representative set of solutions": "howtoguides/IPR.ipynb"
+  - "Core-Logic API Reference":
+      - "": "api/index.md"
+      - "problem": "api/desdeo_problem.md"
+      - "mcdm": "api/desdeo_mcdm.md"
+      - "emo": "api/desdeo_emo.md"
+      - "EMO Pydantic Interface": "api/EMO Options.md"
+      - "tools": "api/desdeo_tools.md"
+      - "adm": "api/desdeo_adm.md"
+      - "gdm": "api/desdeo_gdm.md"
+      - "explanations": "api/desdeo_explanations.md"
+  - "Web-API (WIP)":
+      - "": "web_api/index.md"
+      - "OpenAPI reference": "web_api/openapi.md"
+      - "Database models": "web_api/models.md"
+      - "Database relations mapping": "web_api/relations.md"
+  - "Web-GUI (WIP)":
+      - "": "web_gui/index.md"
+
+watch:
+  - desdeo
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tabs
+    - palette.switch
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - content.code.annotate
+  nav_style: dark
+  highlightjs: true
+  hljs_languages:
+    - python
+    - json
+  locale: en
+  palette:
+    scheme: slate
+    primary: black
+  logo: assets/desdeo_logo.png
+  favicon: assets/desdeo_logo.png
+
+plugins:
+  - search
+  - autorefs
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: true
+            show_bases: true
+            show_signature_annotations: true
+            show_type_annotations: true
+            show_root_heading: true
+            separate_signature: true
+            heading_level: 2
+            merge_init_into_class: false
+            show_root_toc_entry: false
+            group_by_category: true
+            show_category_heading: false
+            show_symbol_type_heading: true
+            show_symbol_type_doc: true
+            filters: []
+          docstring_options:
+            ignore_init_summary: false
+  - include-markdown
+  - mkdocs-jupyter:
+      execute: false # locally, see mkdocs.rtd.yml for RTD conf
+      # Only treat notebooks as notebooks; skips a slow jupytext.read() on every .md.
+      ignore:
+        - "*.md"
+      include_requirejs: true
+      custom_mathjax_url: "https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.7/latest.js?config=TeX-AMS_CHTML-full,Safe"
+      remove_tag_config:
+        remove_input_tags:
+          - hide_code
+        remove_cell_tags:
+          - remove_cell
+  - neoteroi.mkdocsoad:
+      use_pymdownx: true
+
+markdown_extensions:
+  - admonition
+  - mdx_math
+  - pymdownx.arithmatex:
+      generic: true
+  - footnotes
+  - attr_list
+  - md_in_html
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - toc:
+      toc_depth: 3
+
+extra_css:
+  - stylesheets/extra.css
+  - stylesheets/neoteroi-mkdocs.css
+
+extra_javascript:
+  - extrajs/extra.js
+  - extrajs/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
