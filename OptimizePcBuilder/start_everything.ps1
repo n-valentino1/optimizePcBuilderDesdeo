@@ -42,6 +42,22 @@ if (-not (Test-Path (Join-Path $desdeoRoot ".venv"))) {
 python -m pip install --upgrade pip
 python -m pip install -e .
 
+$apiRoot = Join-Path $desdeoRoot "desdeo\api"
+$dbFile = Join-Path $apiRoot "test.db"
+if (-not (Test-Path $dbFile)) {
+    Write-Host "No DESDEO database found. Creating it with the PC builder problem..."
+    $env:PC_BUILDER_DATA_DIR = Join-Path $projectRoot "data"
+    Push-Location $apiRoot
+    try {
+        python db_init_pc_builder.py
+        if ($LASTEXITCODE -ne 0) { throw "db_init_pc_builder.py failed" }
+        python add_representative_for_pc_builder.py
+        if ($LASTEXITCODE -ne 0) { throw "add_representative_for_pc_builder.py failed" }
+    } finally {
+        Pop-Location
+    }
+}
+
 Write-Host "Starting custom project in a separate window..."
 $projectCommand = "cd `"$projectRoot`"; . `"$projectRoot\.venv\Scripts\Activate.ps1`"; python main.py"
 Start-Process powershell.exe -ArgumentList "-NoExit","-ExecutionPolicy","Bypass","-Command", $projectCommand

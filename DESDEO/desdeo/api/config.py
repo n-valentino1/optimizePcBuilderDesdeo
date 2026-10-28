@@ -22,6 +22,16 @@ class GeneralSettings(BaseSettings):
 
 SettingsConfig = GeneralSettings()
 
+def _anchor_sqlite_url(url: str) -> str:
+    """Make a relative SQLite path point inside desdeo/api instead of the current working directory."""
+    prefix = "sqlite:///"
+    if not url.startswith(prefix):
+        return url
+    db_path = url[len(prefix):]
+    if not db_path or db_path == ":memory:" or Path(db_path).is_absolute():
+        return url
+    return prefix + (config_path.parent / db_path).resolve().as_posix()
+
 
 class ServerDebugConfig(BaseSettings):
     """Server setup settings (development)."""
@@ -50,7 +60,7 @@ class DatabaseDebugConfig(BaseSettings):
 
     db_host: str = config_data["database-debug"]["db_host"]
     db_port: str = config_data["database-debug"]["db_port"]
-    db_database: str = config_data["database-debug"]["db_database"]
+    db_database: str = _anchor_sqlite_url(config_data["database-debug"]["db_database"])
     db_username: str = config_data["database-debug"]["db_username"]
     db_password: str = config_data["database-debug"]["db_password"]
     db_pool_size: int = config_data["database-debug"]["db_pool_size"]

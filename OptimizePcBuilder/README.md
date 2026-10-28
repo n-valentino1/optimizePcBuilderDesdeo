@@ -61,6 +61,19 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
+## Create the DESDEO database (first run only)
+
+`start_everything.ps1` does this automatically when `DESDEO\desdeo\api\test.db` is missing. To do it by hand:
+
+```powershell
+cd C:\projects\DESDEO\desdeo\api
+. ..\..\.venv\Scripts\Activate.ps1
+python db_init_pc_builder.py
+python add_representative_for_pc_builder.py
+```
+
+The PC builder problem reads its CSVs from `OptimizePcBuilder\data` next to the DESDEO folder. If your CSVs live somewhere else, set `PC_BUILDER_DATA_DIR` to that folder first. The database always lives at `DESDEO\desdeo\api\test.db`, no matter which folder you start the API from.
+
 ## Start the DESDEO API
 
 ```powershell

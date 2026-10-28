@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -16,8 +17,34 @@ from desdeo.problem.schema import (
 )
 
 
-WORKTREE_ROOT = Path(__file__).resolve().parents[4]
-CUSTOM_PROJECT_DIR = WORKTREE_ROOT / "custom-gui-setup-desdeo-project"
+REPO_ROOT = Path(__file__).resolve().parents[4]
+_REQUIRED_CSVS = ("motherboard.csv", "memory.csv", "internal-hard-drive.csv", "video-card.csv", "cpu.csv")
+
+
+def _find_data_dir() -> Path:
+    """Locate the folder holding the PC component CSV files.
+
+    Checked in order: the PC_BUILDER_DATA_DIR environment variable, the
+    OptimizePcBuilder/data folder next to DESDEO (this repo's layout), and the
+    older custom-gui-setup-desdeo-project folder layout.
+    """
+    candidates = []
+    if env_dir := os.environ.get("PC_BUILDER_DATA_DIR"):
+        candidates.append(Path(env_dir))
+    candidates += [
+        REPO_ROOT / "OptimizePcBuilder" / "data",
+        REPO_ROOT / "optimizePCBuilder" / "data",
+        REPO_ROOT / "custom-gui-setup-desdeo-project" / "data",
+        REPO_ROOT / "custom-gui-setup-desdeo-project",
+    ]
+    for candidate in candidates:
+        if all((candidate / name).is_file() for name in _REQUIRED_CSVS):
+            return candidate
+    searched = "\n  ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        "Could not find the PC component CSV files. Set PC_BUILDER_DATA_DIR to the folder that contains "
+        f"{', '.join(_REQUIRED_CSVS)}. Searched:\n  {searched}"
+    )
 
 
 def parse_ram_gen(speed_str: str) -> int:
@@ -71,14 +98,12 @@ def parse_ssd_cap(cap_str: str) -> float:
 
 def load_component_data() -> dict[str, pd.DataFrame]:
     """Load the component CSV files from the custom PC-builder project."""
-    try:
-        mobos = pd.read_csv(CUSTOM_PROJECT_DIR / "motherboard.csv")
-        ram = pd.read_csv(CUSTOM_PROJECT_DIR / "memory.csv")
-        ssds = pd.read_csv(CUSTOM_PROJECT_DIR / "internal-hard-drive.csv")
-        gpus = pd.read_csv(CUSTOM_PROJECT_DIR / "video-card.csv")
-        cpus = pd.read_csv(CUSTOM_PROJECT_DIR / "cpu.csv")
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"Could not find the PC component CSV files in {CUSTOM_PROJECT_DIR}. {exc}") from exc
+    data_dir = _find_data_dir()
+    mobos = pd.read_csv(data_dir / "motherboard.csv")
+    ram = pd.read_csv(data_dir / "memory.csv")
+    ssds = pd.read_csv(data_dir / "internal-hard-drive.csv")
+    gpus = pd.read_csv(data_dir / "video-card.csv")
+    cpus = pd.read_csv(data_dir / "cpu.csv")
 
     mobos = mobos.dropna(subset=["price", "socket", "max_memory"]).reset_index(drop=True)
     ram = ram.dropna(subset=["price", "speed", "modules"]).reset_index(drop=True)
@@ -227,7 +252,7 @@ def pc_builder_problem() -> Problem:
         ("Total price", "f_1", False, "USD"),
         ("CPU boost clock", "f_2", True, "GHz"),
         ("CPU core count", "f_3", True, "count"),
-        ("GPU VRAM", "f_4", True, "MB"),
+        ("GPU VRAM", "f_4", True, "GB"),
         ("GPU core clock", "f_5", True, "MHz"),
         ("SSD capacity", "f_6", True, "GB"),
     ]
